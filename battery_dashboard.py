@@ -12,11 +12,14 @@ What it does
   - charge/discharge efficiency
   - initial/minimum SOC
   - optional import/export electricity prices
+  - EV charging threshold, EV charging power, and EV reward per kWh
 - Shows date-range or single-day graphs for:
   - battery state of charge (SOC)
   - charging/discharging power
   - grid import/export before and after battery
   - PV production and consumption
+- Infers EV/car charging from high-consumption periods.
+- Adds an adjustable extra reward for each kWh charged into cars.
 - Calculates usefulness metrics.
 
 Run
@@ -61,6 +64,18 @@ class BatteryConfig:
     @property
     def total_power_kw(self) -> float:
         return max(0.0, self.power_per_battery_kw * self.number_of_batteries)
+
+
+@dataclass(frozen=True)
+class EVChargingConfig:
+    """Configuration for inferring car charging from measured house consumption."""
+
+    enabled: bool = True
+    threshold_kw: float = 9.0
+    charging_power_kw: float = 7.0
+    reward_per_kwh: float = 0.14
+    detection_mode: str = "fixed_above_threshold"
+    cap_to_measured_load: bool = True
 
 
 @dataclass(frozen=True)
@@ -177,6 +192,42 @@ def load_home_data(source: str | Path | BinaryIO) -> Tuple[pd.DataFrame, ColumnM
     return df, colmap
 
 
+def apply_ev_charging_model(df: pd.DataFrame, config: EVChargingConfig) -> pd.DataFrame:
+    """
+    Infer car charging from measured load.
+
+    The input data usually contains one total consumption/load column. This function creates:
+    - ev_charging_kw: inferred car charging power
+    - non_ev_house_load_kw: measured load minus inferred car charging
+
+    Detection modes:
+    - fixed_above_threshold: if total load is above the threshold, count a fixed charging power.
+    - excess_above_threshold: count only the part of load above the threshold, capped by charging power.
+    """
+    out = df.copy()
+
+    if "load_kw" not in out.columns or out["load_kw"].isna().all() or not config.enabled:
+        out["ev_charging_kw"] = 0.0
+        out["non_ev_house_load_kw"] = out["load_kw"].fillna(0.0) if "load_kw" in out.columns else 0.0
+        return out
+
+    load = out["load_kw"].fillna(0.0).clip(lower=0.0)
+    threshold = max(0.0, float(config.threshold_kw))
+    charging_power = max(0.0, float(config.charging_power_kw))
+
+    if config.detection_mode == "excess_above_threshold":
+        ev_kw = (load - threshold).clip(lower=0.0).clip(upper=charging_power)
+    else:
+        ev_kw = pd.Series(np.where(load > threshold, charging_power, 0.0), index=out.index, dtype="float64")
+
+    if config.cap_to_measured_load:
+        ev_kw = np.minimum(ev_kw, load)
+
+    out["ev_charging_kw"] = pd.Series(ev_kw, index=out.index).fillna(0.0).clip(lower=0.0)
+    out["non_ev_house_load_kw"] = (load - out["ev_charging_kw"]).clip(lower=0.0)
+    return out
+
+
 def simulate_battery(df: pd.DataFrame, config: BatteryConfig) -> pd.DataFrame:
     """
     Simulate a behind-the-meter battery.
@@ -256,14 +307,22 @@ def simulate_battery(df: pd.DataFrame, config: BatteryConfig) -> pd.DataFrame:
     return out
 
 
-def summarize(df: pd.DataFrame, config: BatteryConfig, import_price: float = 0.0, export_price: float = 0.0) -> dict[str, float]:
-    """Summarize energy and battery usefulness for the supplied period."""
+def summarize(
+    df: pd.DataFrame,
+    config: BatteryConfig,
+    import_price: float = 0.0,
+    export_price: float = 0.0,
+    ev_reward_per_kwh: float = 0.0,
+) -> dict[str, float]:
+    """Summarize energy, battery usefulness, and inferred EV charging for the supplied period."""
     if len(df) == 0:
         return {}
 
     dt = df["dt_h"]
     pv_kwh = float((df["pv_kw"].fillna(0) * dt).sum())
     load_kwh = float((df["load_kw"].fillna(0) * dt).sum())
+    ev_charging_kwh = float((df.get("ev_charging_kw", pd.Series(0.0, index=df.index)) * dt).sum())
+    non_ev_house_load_kwh = float((df.get("non_ev_house_load_kw", df["load_kw"].fillna(0.0)) * dt).sum())
     baseline_import_kwh = float((df["baseline_deficit_kw"] * dt).sum())
     baseline_export_kwh = float((df["baseline_surplus_kw"] * dt).sum())
     after_import_kwh = float((df["grid_import_after_kw"] * dt).sum())
@@ -281,11 +340,15 @@ def summarize(df: pd.DataFrame, config: BatteryConfig, import_price: float = 0.0
 
     total_capacity = config.total_capacity_kwh
     cycles = discharged_kwh / total_capacity if total_capacity > 0 else 0.0
-    savings = avoided_import_kwh * import_price - reduced_export_kwh * export_price
+    battery_value = avoided_import_kwh * import_price - reduced_export_kwh * export_price
+    ev_reward = ev_charging_kwh * max(0.0, ev_reward_per_kwh)
 
     return {
         "PV generation kWh": pv_kwh,
-        "Home consumption kWh": load_kwh,
+        "Total measured consumption kWh": load_kwh,
+        "Non-EV house consumption kWh": non_ev_house_load_kwh,
+        "EV charging kWh": ev_charging_kwh,
+        "EV share of consumption %": 100 * ev_charging_kwh / load_kwh if load_kwh > 0 else 0.0,
         "Grid import before battery kWh": baseline_import_kwh,
         "Grid import after battery kWh": after_import_kwh,
         "Grid export before battery kWh": baseline_export_kwh,
@@ -299,9 +362,10 @@ def summarize(df: pd.DataFrame, config: BatteryConfig, import_price: float = 0.0
         "Self-consumption after %": 100 * (pv_kwh - after_export_kwh) / pv_kwh if pv_kwh > 0 else 0.0,
         "Self-sufficiency before %": 100 * (load_kwh - baseline_import_kwh) / load_kwh if load_kwh > 0 else 0.0,
         "Self-sufficiency after %": 100 * (load_kwh - after_import_kwh) / load_kwh if load_kwh > 0 else 0.0,
-        "Estimated value": savings,
+        "Estimated value": battery_value,
+        "EV charging reward": ev_reward,
+        "Estimated value including EV reward": battery_value + ev_reward,
     }
-
 
 def _fmt_kwh(x: float) -> str:
     return f"{x:,.1f} kWh"
@@ -348,6 +412,45 @@ def run_streamlit_app() -> None:
         import_price = st.number_input("Import price (€/kWh)", min_value=0.0, value=0.30, step=0.01)
         export_price = st.number_input("Export compensation (€/kWh)", min_value=0.0, value=0.05, step=0.01)
 
+        st.header("EV / car charging")
+        ev_enabled = st.checkbox(
+            "Infer car charging from high consumption",
+            value=True,
+            help="Uses the measured total consumption column to estimate when the car is charging.",
+        )
+        ev_threshold_kw = st.number_input(
+            "Consumption threshold for car charging (kW)",
+            min_value=0.0,
+            value=9.0,
+            step=0.5,
+            help="When measured consumption is above this level, the app assumes car charging is active.",
+        )
+        ev_charging_power_kw = st.number_input(
+            "Car charging power when active (kW)",
+            min_value=0.0,
+            value=7.0,
+            step=0.5,
+        )
+        ev_reward_per_kwh = st.number_input(
+            "Extra reward for car charging (€/kWh)",
+            min_value=0.0,
+            value=0.14,
+            step=0.01,
+        )
+        ev_detection_label = st.selectbox(
+            "Car charging detection method",
+            ["Fixed power above threshold", "Only excess above threshold"],
+            help=(
+                "Fixed: if consumption is above the threshold, count the chosen charging power. "
+                "Excess: count only the kW above the threshold, capped by the chosen charging power."
+            ),
+        )
+        ev_cap_to_load = st.checkbox(
+            "Cap car charging to measured consumption",
+            value=True,
+            help="Prevents inferred car charging from being higher than the measured total consumption in an interval.",
+        )
+
         st.header("Sizing comparison")
         max_sweep_batteries = st.number_input(
             "Compare 0 to this many batteries", min_value=0, max_value=50, value=max(5, int(number_of_batteries)), step=1
@@ -355,6 +458,18 @@ def run_streamlit_app() -> None:
 
     data_source = uploaded if uploaded is not None else default_file
     df, colmap = load_home_data(data_source)
+
+    ev_cfg = EVChargingConfig(
+        enabled=bool(ev_enabled),
+        threshold_kw=ev_threshold_kw,
+        charging_power_kw=ev_charging_power_kw,
+        reward_per_kwh=ev_reward_per_kwh,
+        detection_mode="excess_above_threshold" if ev_detection_label == "Only excess above threshold" else "fixed_above_threshold",
+        cap_to_measured_load=bool(ev_cap_to_load),
+    )
+    df = apply_ev_charging_model(df, ev_cfg)
+    if ev_enabled and colmap.load_kw is None:
+        st.warning("EV charging inference needs a measured consumption/load column. No EV charging was inferred.")
 
     min_date = df["timestamp"].dt.date.min()
     max_date = df["timestamp"].dt.date.max()
@@ -402,7 +517,13 @@ def run_streamlit_app() -> None:
         st.warning("No data in the selected period.")
         st.stop()
 
-    metrics = summarize(summary_scope, cfg, import_price=import_price, export_price=export_price)
+    metrics = summarize(
+        summary_scope,
+        cfg,
+        import_price=import_price,
+        export_price=export_price,
+        ev_reward_per_kwh=ev_cfg.reward_per_kwh,
+    )
 
     st.subheader("Battery setup")
     c1, c2, c3, c4 = st.columns(4)
@@ -423,7 +544,13 @@ def run_streamlit_app() -> None:
         ),
     )
     m3.metric("Equivalent full cycles", f"{metrics['Equivalent full cycles']:,.2f}")
-    m4.metric("Estimated value", _fmt_money(metrics["Estimated value"]))
+    m4.metric("Battery value", _fmt_money(metrics["Estimated value"]))
+
+    ev1, ev2, ev3, ev4 = st.columns(4)
+    ev1.metric("Energy to cars", _fmt_kwh(metrics["EV charging kWh"]))
+    ev2.metric("EV share of consumption", _fmt_percent(metrics["EV share of consumption %"]))
+    ev3.metric("EV charging reward", _fmt_money(metrics["EV charging reward"]))
+    ev4.metric("Total value incl. EV", _fmt_money(metrics["Estimated value including EV reward"]))
 
     m5, m6, m7, m8 = st.columns(4)
     m5.metric("Self-consumption before", _fmt_percent(metrics["Self-consumption before %"]))
@@ -465,9 +592,41 @@ def run_streamlit_app() -> None:
     if view["pv_kw"].notna().any() and view["load_kw"].notna().any():
         fig_pv_load = go.Figure()
         fig_pv_load.add_trace(go.Scatter(x=view["timestamp"], y=view["pv_kw"], name="PV production (kW)", mode="lines"))
-        fig_pv_load.add_trace(go.Scatter(x=view["timestamp"], y=view["load_kw"], name="House consumption (kW)", mode="lines"))
+        fig_pv_load.add_trace(go.Scatter(x=view["timestamp"], y=view["load_kw"], name="Total measured consumption (kW)", mode="lines"))
+        if "non_ev_house_load_kw" in view.columns:
+            fig_pv_load.add_trace(
+                go.Scatter(x=view["timestamp"], y=view["non_ev_house_load_kw"], name="Consumption excluding cars (kW)", mode="lines")
+            )
         fig_pv_load.update_layout(yaxis_title="Power (kW)", xaxis_title="Time", hovermode="x unified", height=380)
         st.plotly_chart(fig_pv_load, use_container_width=True)
+
+    if "ev_charging_kw" in view.columns and ev_cfg.enabled:
+        fig_ev = go.Figure()
+        fig_ev.add_trace(go.Scatter(x=view["timestamp"], y=view["ev_charging_kw"], name="Inferred car charging (kW)", mode="lines"))
+        fig_ev.add_trace(go.Scatter(x=view["timestamp"], y=view["load_kw"], name="Total measured consumption (kW)", mode="lines"))
+        fig_ev.update_layout(
+            yaxis_title="Power (kW)",
+            xaxis_title="Time",
+            hovermode="x unified",
+            height=340,
+        )
+        st.plotly_chart(fig_ev, use_container_width=True)
+
+        daily_ev = (
+            view.assign(date=view["timestamp"].dt.date, ev_kwh=view["ev_charging_kw"] * view["dt_h"])
+            .groupby("date", as_index=False)["ev_kwh"]
+            .sum()
+        )
+        if not daily_ev.empty:
+            fig_ev_daily = go.Figure()
+            fig_ev_daily.add_trace(go.Bar(x=daily_ev["date"], y=daily_ev["ev_kwh"], name="Car charging energy (kWh)"))
+            fig_ev_daily.update_layout(
+                yaxis_title="Car charging energy (kWh/day)",
+                xaxis_title="Date",
+                hovermode="x unified",
+                height=320,
+            )
+            st.plotly_chart(fig_ev_daily, use_container_width=True)
 
     st.subheader("Sizing comparison")
     sweep_rows = []
@@ -487,7 +646,13 @@ def run_streamlit_app() -> None:
         else:
             selected = df[(df["timestamp"] >= start_ts) & (df["timestamp"] < end_ts)].copy()
             sweep_view = simulate_battery(selected, sweep_cfg)
-        sweep_metrics = summarize(sweep_view, sweep_cfg, import_price=import_price, export_price=export_price)
+        sweep_metrics = summarize(
+            sweep_view,
+            sweep_cfg,
+            import_price=import_price,
+            export_price=export_price,
+            ev_reward_per_kwh=ev_cfg.reward_per_kwh,
+        )
         sweep_rows.append(
             {
                 "Batteries": n,
@@ -499,7 +664,9 @@ def run_streamlit_app() -> None:
                 "Self-consumption after %": sweep_metrics.get("Self-consumption after %", 0.0),
                 "Self-sufficiency after %": sweep_metrics.get("Self-sufficiency after %", 0.0),
                 "Equivalent full cycles": sweep_metrics.get("Equivalent full cycles", 0.0),
-                "Estimated value": sweep_metrics.get("Estimated value", 0.0),
+                "Battery value": sweep_metrics.get("Estimated value", 0.0),
+                "EV reward": sweep_metrics.get("EV charging reward", 0.0),
+                "Total value incl. EV": sweep_metrics.get("Estimated value including EV reward", 0.0),
             }
         )
     sweep_df = pd.DataFrame(sweep_rows)
@@ -527,6 +694,8 @@ def run_streamlit_app() -> None:
         "timestamp",
         "pv_kw",
         "load_kw",
+        "ev_charging_kw",
+        "non_ev_house_load_kw",
         "baseline_deficit_kw",
         "baseline_surplus_kw",
         "battery_charge_kw",
@@ -539,7 +708,7 @@ def run_streamlit_app() -> None:
     ]
     st.download_button(
         "Download simulated selected period as CSV",
-        data=view[export_cols].to_csv(index=False).encode("utf-8"),
+        data=view[[col for col in export_cols if col in view.columns]].to_csv(index=False).encode("utf-8"),
         file_name="battery_simulation_selected_period.csv",
         mime="text/csv",
     )
@@ -558,8 +727,10 @@ def run_streamlit_app() -> None:
             """
             **Model assumptions**
             - Battery charges only from PV surplus and discharges only to cover house demand.
-            - No grid charging, dynamic tariff optimization, or EV-specific logic is included.
-            - The battery is simulated on net surplus/deficit per interval: `PV - house load`.
+            - No grid charging or dynamic tariff optimization is included.
+            - EV/car charging is inferred from total measured consumption using your threshold and charging-power settings.
+            - EV charging is treated as part of the measured load; the battery model still uses the total net surplus/deficit per interval.
+            - The extra EV reward is calculated as `inferred EV kWh × reward €/kWh`.
             - Large timestamp gaps are treated as one normal interval to avoid over-counting missing data.
             """
         )
